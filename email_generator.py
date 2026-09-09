@@ -29,6 +29,8 @@ from __future__ import annotations
 import argparse
 import datetime
 import json
+import os
+import shutil
 import subprocess
 import sys
 import uuid
@@ -46,14 +48,47 @@ def utc_now_iso() -> str:
     return datetime.datetime.now(datetime.timezone.utc).isoformat()
 
 
+_OPENCODE_ARGV_CACHE: list[str] | None = None
+
+
+def _opencode_argv() -> list[str]:
+    """Argv prefix invoking the real OpenCode CLI (see website_generator)."""
+    global _OPENCODE_ARGV_CACHE
+    if _OPENCODE_ARGV_CACHE is not None:
+        return _OPENCODE_ARGV_CACHE
+    candidates: list[list[str]] = []
+    npm_cmd = Path.home() / "AppData" / "Roaming" / "npm" / "opencode.cmd"
+    if npm_cmd.exists():
+        candidates.append([os.environ.get("COMSPEC", "cmd.exe"), "/c", str(npm_cmd)])
+    which_hit = shutil.which(OPENCODE_CMD)
+    if which_hit:
+        candidates.append([which_hit])
+    candidates.append([OPENCODE_CMD])
+    for prefix in candidates:
+        try:
+            p = subprocess.run([*prefix, "--version"], capture_output=True,
+                               text=True, encoding="utf-8", errors="replace",
+                               timeout=30)
+        except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
+            continue
+        out = (p.stdout or "") + (p.stderr or "")
+        if p.returncode == 0 and "Traceback" not in out \
+                and "ModuleNotFoundError" not in out:
+            _OPENCODE_ARGV_CACHE = prefix
+            return prefix
+    raise RuntimeError("No working OpenCode CLI found "
+                       "(tried npm opencode.cmd + PATH `opencode`)")
+
+
 def run_opencode_command(target_dir: Path, prompt: str, timeout: int = 300) -> str:
     """Call OpenCode; raise RuntimeError if CLI missing/fails (caller falls back)."""
     target_dir.mkdir(parents=True, exist_ok=True)
+    prefix = _opencode_argv()
     try:
-        proc = subprocess.run([OPENCODE_CMD, "run", prompt], cwd=str(target_dir),
-                              capture_output=True, text=True, timeout=timeout)
-    except FileNotFoundError:
-        raise RuntimeError(f"OpenCode CLI '{OPENCODE_CMD}' not found on PATH")
+        proc = subprocess.run([*prefix, "run", prompt], cwd=str(target_dir),
+                              capture_output=True, text=True,
+                              encoding="utf-8", errors="replace",
+                              timeout=timeout)
     except subprocess.TimeoutExpired:
         raise RuntimeError("OpenCode run timed out")
     if proc.returncode != 0:

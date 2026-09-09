@@ -38,6 +38,7 @@ import argparse
 import datetime
 import html as htmlmod
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -63,19 +64,59 @@ def esc(s) -> str:
 # OpenCode bridge
 # ---------------------------------------------------------------------------
 
+_OPENCODE_ARGV_CACHE: list[str] | None = None
+
+
+def _opencode_argv() -> list[str]:
+    """Argv prefix invoking the real OpenCode CLI.
+
+    Bare `opencode` is unreliable on Windows: subprocess (no shell) resolves
+    `opencode` -> `opencode.exe`, which can hit a broken shadow (e.g. an
+    orphaned PyPI console script) instead of the real CLI's `opencode.cmd`.
+    So prefer npm's opencode.cmd (run via cmd.exe) and sanity-check every
+    candidate with `--version`, rejecting tracebacks. Result is cached.
+    Raises RuntimeError if no working CLI is found.
+    """
+    global _OPENCODE_ARGV_CACHE
+    if _OPENCODE_ARGV_CACHE is not None:
+        return _OPENCODE_ARGV_CACHE
+    candidates: list[list[str]] = []
+    npm_cmd = Path.home() / "AppData" / "Roaming" / "npm" / "opencode.cmd"
+    if npm_cmd.exists():
+        candidates.append([os.environ.get("COMSPEC", "cmd.exe"), "/c", str(npm_cmd)])
+    which_hit = shutil.which(OPENCODE_CMD)
+    if which_hit:
+        candidates.append([which_hit])
+    candidates.append([OPENCODE_CMD])
+    for prefix in candidates:
+        try:
+            p = subprocess.run([*prefix, "--version"], capture_output=True,
+                               text=True, encoding="utf-8", errors="replace",
+                               timeout=30)
+        except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
+            continue
+        out = (p.stdout or "") + (p.stderr or "")
+        if p.returncode == 0 and "Traceback" not in out \
+                and "ModuleNotFoundError" not in out:
+            _OPENCODE_ARGV_CACHE = prefix
+            return prefix
+    raise RuntimeError("No working OpenCode CLI found "
+                       "(tried npm opencode.cmd + PATH `opencode`)")
+
 def run_opencode_command(target_dir: Path, prompt: str, timeout: int = 600) -> str:
     """Run OpenCode in target_dir with prompt; return stdout.
 
-    Uses `opencode run "<prompt>"`. Raises RuntimeError if the CLI is
-    missing or exits non-zero — caller falls back to the template engine.
+    Uses `opencode run "<prompt>"` via the real OpenCode CLI (resolved by
+    _opencode_argv, never a broken PATH shadow). Raises RuntimeError if the
+    CLI is missing or exits non-zero — caller falls back to the template.
     """
     target_dir.mkdir(parents=True, exist_ok=True)
+    prefix = _opencode_argv()
     try:
         proc = subprocess.run(
-            [OPENCODE_CMD, "run", prompt],
-            cwd=str(target_dir), capture_output=True, text=True, timeout=timeout)
-    except FileNotFoundError:
-        raise RuntimeError(f"OpenCode CLI '{OPENCODE_CMD}' not found on PATH")
+            [*prefix, "run", prompt],
+            cwd=str(target_dir), capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=timeout)
     except subprocess.TimeoutExpired:
         raise RuntimeError("OpenCode run timed out")
     if proc.returncode != 0:
@@ -92,11 +133,14 @@ def build_prompt(b: dict, feedback: dict | None) -> str:
     reviews = b.get("review_count")
     problems = (b.get("website_analysis") or {}).get("problems") or []
     lines = [
-        f"Build a complete, professional, mobile-responsive small-business website for '{name}' ({category}).",
+        "Your working directory IS the website root. Create exactly these files "
+        "right here in the current directory: index.html, styles.css, script.js. "
+        "Do not create any subfolders and do not write files anywhere else.",
+        f"Build a complete, professional, mobile-responsive website for '{name}' ({category}).",
         f"Business details: address='{address}', phone='{phone}', "
         f"rating={rating} ({reviews} reviews)." if (rating or reviews) else
         f"Business details: address='{address}', phone='{phone}'.",
-        "Output exactly three files in the current directory: index.html, styles.css, script.js.",
+        "Output exactly these three files in the current directory: index.html, styles.css, script.js.",
         "Requirements: semantic HTML with <nav>, <h1>, CTA buttons (Call Now, Get a Quote, Book Appointment),",
         "tel: link, contact form with validation, viewport meta, responsive CSS with media queries,",
         "meta description, favicon (inline SVG data URI is fine), alt text on images, readable typography.",
@@ -297,22 +341,63 @@ def parse_args(argv=None):
     return p.parse_args(argv)
 
 
-def main(argv=None, **kwargs) -> str | int:
-    """Build working sites. Returns the sites root dir (str) or int exit code.
+def main(argv=None, lead_data: dict | None = None, **kwargs) -> str | int:
+    """Build a working site. Returns the site dir (str) or int exit code.
 
-    Orchestrator use: ``main(leads="target_leads.json", output_dir="generated_sites",
-    lead="lead_00001")`` — any keyword matching an argparse option overrides the
-    default. A bare main() call uses defaults (sys.argv is only used via the CLI).
+    Orchestrator use (single entry — looping lives in orchestrator.py)::
+        main(lead_data={"lead_id": "lead_00001", "name": ..., ...})
+        main(lead_data=entry, output_dir="generated_sites", force=False,
+             no_opencode=False, feedback=None)
+
+    CLI / batch use (legacy)::
+        main(leads="target_leads.json", lead="lead_00001", ...)
+        main(argv=["--leads", "target_leads.json", "--lead", "lead_00001"])
+
+    A bare main() call uses defaults (sys.argv is only used via the CLI).
     """
+    # Allow main(entry_dict) shorthand: first positional is the lead entry.
+    if isinstance(argv, dict) and lead_data is None:
+        lead_data = argv
+        argv = []
     if argv is None:
         # Plain main() uses defaults (never sys.argv); the CLI passes
         # sys.argv[1:] explicitly via the __main__ block below.
         argv = []
     args = parse_args(argv)
+    # lead_data can also arrive via **kwargs (keeps old call style working).
+    if "lead_data" in kwargs:
+        if lead_data is not None:
+            raise TypeError("website_generator.main() got lead_data twice")
+        lead_data = kwargs.pop("lead_data")
     for _k, _v in kwargs.items():
         if not hasattr(args, _k):
             raise TypeError(f"website_generator.main() got an unexpected option {_k!r}")
         setattr(args, _k, _v)
+    # Convenience: main(lead={...dict...}) also means single-entry mode.
+    if lead_data is None and isinstance(args.lead, dict):
+        lead_data = args.lead
+    feedback = None
+    if args.feedback is not None:
+        if isinstance(args.feedback, dict):
+            feedback = args.feedback
+        else:
+            feedback = json.loads(Path(args.feedback).read_text(encoding="utf-8"))
+    out_root = Path(args.output_dir)
+    use_opencode = not args.no_opencode
+    if lead_data is not None:
+        # --- Single-entry mode (orchestrator loops, we build one) ---
+        if not isinstance(lead_data, dict):
+            print("[website_generator] ERROR: lead_data must be a dict", file=sys.stderr)
+            return 2
+        if not lead_data.get("lead_id"):
+            print("[website_generator] ERROR: lead_data missing 'lead_id'", file=sys.stderr)
+            return 2
+        res = generate_one(lead_data, out_root, feedback, use_opencode, args.force)
+        if res["skipped"]:
+            print(f"[website_generator] skip {res['lead_id']} (exists, use --force)", flush=True)
+        else:
+            print(f"[website_generator] built {res['lead_id']} [{res['engine']}] -> {res['dir']}", flush=True)
+        return str(res["dir"])
     leads_path = Path(args.leads)
     if not leads_path.exists():
         print(f"[website_generator] ERROR: {leads_path} not found", file=sys.stderr)
@@ -323,14 +408,10 @@ def main(argv=None, **kwargs) -> str | int:
         print(f"[website_generator] ERROR: {e}", file=sys.stderr)
         return 2
     try:
-        selected = select_leads(leads, args.lead, args.limit)
+        selected = select_leads(leads, args.lead if isinstance(args.lead, (str, type(None))) else None, args.limit)
     except ValueError as e:
         print(f"[website_generator] ERROR: {e}", file=sys.stderr)
         return 2
-    feedback = None
-    if args.feedback:
-        feedback = json.loads(Path(args.feedback).read_text(encoding="utf-8"))
-    out_root = Path(args.output_dir)
     print(f"[website_generator] building {len(selected)} site(s) via "
           f"{'template' if args.no_opencode else 'opencode→template fallback'}", flush=True)
     built, skipped = 0, 0

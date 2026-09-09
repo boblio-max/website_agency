@@ -1,0 +1,50 @@
+[
+  {
+    "name": "One Repair",
+    "category": "Auto repair shop",
+    "address": "12625 NE 189th St, Bothell, WA 98011",
+    "phone": "(425) 202-7470",
+    "website": null,
+    "rating": 4.9,
+    "review_count": 83,
+    "maps_url": "https://www.google.com/maps/place/One+Repair/data=!4m7!3m6!1s0x549013e8fbf5352d:0xa91e45937e131cfb!8m2!3d47.7637447!4d-122.1711471!16s%2Fg%2F11ghfsqgf5!19sChIJLTX1--gTkFQR-xwTfpNFHqk?authuser=0&hl=en&g_ep=EgoyMDI2MDkwMi4wIJJjKgBIAVAD&rclk=1",
+    "source": "google_maps",
+    "discovered_at": "2026-09-09T04:27:59.012005+00:00"
+  },
+  {
+    "name": "BOTHELL IMPORT SERVICE auto repair",
+    "category": "Brake shop",
+    "address": "19319 Bothell Everett Hwy, Bothell, WA 98012",
+    "phone": null,
+    "website": null,
+    "rating": 4.1,
+    "review_count": 56,
+    "maps_url": "https://www.google.com/maps/place/BOTHELL+IMPORT+SERVICE+auto+repair/data=!4m7!3m6!1s0x54900f5c0c1bf567:0x2ad4aabf77250057!8m2!3d47.8224411!4d-122.2070771!16s%2Fg%2F1tdkly4j!19sChIJZ_UbDFwPkFQRVwAld7-q1Co?authuser=0&hl=en&g_ep=EgoyMDI2MDkwMi4wIJJjKgBIAVAD&rclk=1",
+    "source": "google_maps",
+    "discovered_at": "2026-09-09T04:28:36.308596+00:00"
+  },
+  {
+    "name": "Mama Bear's Espresso",
+    "category": "Coffee stand",
+    "address": "20702 Bothell Everett Hwy, Bothell, WA 98012",
+    "phone": "(425) 398-3774",
+    "website": null,
+    "rating": 4.6,
+    "review_count": 31,
+    "maps_url": "https://www.google.com/maps/place/Mama+Bear%27s+Espresso/data=!4m7!3m6!1s0x54900f6bbe35246d:0xc64ddf6c27db776b!8m2!3d47.81046!4d-122.208105!16s%2Fg%2F11c6pqsz76!19sChIJbSQ1vmsPkFQRa3fbJ2zfTcY?authuser=0&hl=en&g_ep=EgoyMDI2MDkwMi4wIJJjKgBIAVAD&rclk=1",
+    "source": "google_maps",
+    "discovered_at": "2026-09-09T04:29:15.747014+00:00"
+  },
+  {
+    "name": "Milky Way Espresso",
+    "category": "Coffee stand",
+    "address": "19005 Bothell Way NE, Bothell, WA 98011",
+    "phone": "(425) 419-9205",
+    "website": null,
+    "rating": 4.9,
+    "review_count": 34,
+    "maps_url": "https://www.google.com/maps/place/Milky+Way+Espresso/data=!4m7!3m6!1s0x54900fc3d04bcb41:0x6a4cd2765ed04bbe!8m2!3d47.7658469!4d-122.210186!16s%2Fg%2F11wmn7z1cc!19sChIJQctL0MMPkFQRvkvQXnbSTGo?authuser=0&hl=en&g_ep=EgoyMDI2MDkwMi4wIJJjKgBIAVAD&rclk=1",
+    "source": "google_maps",
+    "discovered_at": "2026-09-09T04:29:48.237091+00:00"
+  }
+]

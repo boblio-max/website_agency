@@ -2,15 +2,19 @@
 qa_bot.py (Bot 6) — Independently judge whether a Bot 5 site is deployable.
 
 Input:
-    generated_sites/<lead_id>/   (index.html + styles.css + script.js)
+    path to one site folder (str), e.g. "generated_sites/lead_00001"
+    (index.html + styles.css + script.js + meta.json)
 
 Inspects (critical, independent of Bot 5):
     visual quality · desktop layout · mobile layout · navigation ·
     buttons/links · forms · content accuracy · responsiveness ·
     accessibility · performance · broken elements · professionalism
 
-Output (single lead):
-    {"passed": true, "score": 94, "issues": [], "recommendations": [...], ...}
+Output:
+    <site_dir>/qa_report.json — run history (list, latest last):
+    [{"passed": true, "score": 94, "issues": [], ...}, ...]
+
+    Re-runs append; the file is created on first run.
 
 If it fails:
     {"passed": false, "score": 71,
@@ -19,9 +23,8 @@ If it fails:
 A failed QA stops the pipeline (exit code 1) — no automatic retry loop.
 
 Usage:
+    python qa_bot.py generated_sites/lead_00001
     python qa_bot.py --site generated_sites/lead_00001
-    python qa_bot.py --lead lead_00001 --sites-dir generated_sites --leads target_leads.json
-    python qa_bot.py --all --sites-dir generated_sites --output qa_reports.json
 """
 
 from __future__ import annotations
@@ -47,22 +50,27 @@ def utc_now_iso() -> str:
     return datetime.datetime.now(datetime.timezone.utc).isoformat()
 
 
-def load_lead(leads_path: Path | None, lead_id: str) -> dict:
-    if not leads_path or not leads_path.exists():
-        return {}
+def load_lead_from_site(site_dir: Path) -> dict:
+    """Load lead context from <site_dir>/meta.json (written by Bot 5).
+
+    Returns a lead-like dict with at least ``lead_id`` plus ``name``/``phone``
+    when available, so content-accuracy checks work without target_leads.json.
+    """
+    fallback = {"lead_id": site_dir.name}
     try:
-        raw = json.loads(leads_path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError:
-        return {}
-    if isinstance(raw, dict):
-        for k in ("leads", "businesses", "results", "data"):
-            if isinstance(raw.get(k), list):
-                raw = raw[k]
-                break
-    for r in (raw if isinstance(raw, list) else []):
-        if isinstance(r, dict) and r.get("lead_id") == lead_id:
-            return r
-    return {}
+        raw = json.loads((site_dir / "meta.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return fallback
+    if not isinstance(raw, dict):
+        return fallback
+    lead: dict = {"lead_id": raw.get("lead_id") or site_dir.name}
+    business = raw.get("business")
+    if isinstance(business, dict):
+        for k in ("name", "category", "address", "phone", "website",
+                  "rating", "review_count"):
+            if business.get(k) is not None:
+                lead[k] = business[k]
+    return lead
 
 
 def check_site(site_dir: Path, lead: dict, threshold: int) -> dict:
@@ -205,82 +213,93 @@ def check_site(site_dir: Path, lead: dict, threshold: int) -> dict:
 
 
 def parse_args(argv=None):
-    p = argparse.ArgumentParser(description="Bot 6: QA a generated site (fail stops pipeline)")
-    g = p.add_mutually_exclusive_group()
-    g.add_argument("--site", default=None, help="Path to generated_sites/<lead_id>")
-    g.add_argument("--lead", default=None, help="Lead id (resolved under --sites-dir)")
-    p.add_argument("--all", action="store_true", help="QA every site under --sites-dir")
-    p.add_argument("--sites-dir", default="generated_sites")
-    p.add_argument("--leads", default="target_leads.json", help="For content-accuracy checks")
+    p = argparse.ArgumentParser(description="Bot 6: QA one generated site (fail stops pipeline)")
+    p.add_argument("site", nargs="?", default=None,
+                   help="Path to generated_sites/<lead_id>")
+    p.add_argument("--site", dest="site_opt", default=None,
+                   help="Same as positional site (CLI convenience)")
     p.add_argument("--threshold", "-t", type=int, default=PASS_THRESHOLD)
-    p.add_argument("--output", "-o", default="qa_report.json",
-                   help="Report path for single-site mode (multi-site: qa_reports.json)")
+    p.add_argument("--output", "-o", default=None,
+                   help="Report path (default: <site>/qa_report.json)")
     return p.parse_args(argv)
 
 
-def main(argv=None, **kwargs) -> str | int:
-    """QA generated site(s). Returns the report path (str) when QA passes, int otherwise.
+def append_report(path: Path, report: dict) -> list[dict]:
+    """Append report to qa history file; create it if missing.
 
-    Orchestrator use: ``main(site="generated_sites/lead_00001")`` or
-    ``main(all=True)`` — any keyword matching an argparse option overrides the
-    default. A bare main() call uses defaults (sys.argv is only used via the CLI).
-    A failed gate returns 1 (no usable output); missing input returns 2.
+    File shape is always a list (latest last). Legacy single-dict files
+    are migrated to [old, new]. Corrupt/empty files are reset to [report].
+    Returns the full history list.
     """
+    history: list[dict] = []
+    if path.exists():
+        try:
+            existing = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            existing = None
+        if isinstance(existing, list):
+            history = [r for r in existing if isinstance(r, dict)]
+        elif isinstance(existing, dict):
+            history = [existing]
+    history.append(report)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(history, ensure_ascii=False, indent=2), encoding="utf-8")
+    return history
+
+
+def main(argv=None, site_path: str | Path | None = None, **kwargs) -> str | int:
+    """QA one generated site. Returns qa_report.json path (str) on pass, int otherwise.
+
+    Orchestrator use: ``main("generated_sites/lead_00001")`` or
+    ``main(site_path="generated_sites/lead_00001")`` — a single folder-path
+    string. Optional overrides: ``threshold``, ``output``.
+    A failed gate returns 1; missing input returns 2.
+    """
+    # --- Normalize single-string input -----------------------------------
+    # Allow main("generated_sites/lead_00001") shorthand.
+    if isinstance(argv, (str, Path)) and site_path is None:
+        site_path = argv
+        argv = []
     if argv is None:
-        # Plain main() uses defaults (never sys.argv); the CLI passes
-        # sys.argv[1:] explicitly via the __main__ block below.
         argv = []
     args = parse_args(argv)
+    # site_path can also arrive via **kwargs (orchestrator style).
+    if "site_path" in kwargs:
+        if site_path is not None:
+            raise TypeError("qa_bot.main() got site_path twice")
+        site_path = kwargs.pop("site_path")
+    # Legacy alias: main(site="...").
+    if "site" in kwargs:
+        if site_path is not None:
+            raise TypeError("qa_bot.main() got site_path twice")
+        site_path = kwargs.pop("site")
     for _k, _v in kwargs.items():
         if not hasattr(args, _k):
             raise TypeError(f"qa_bot.main() got an unexpected option {_k!r}")
         setattr(args, _k, _v)
-    sites_root = Path(args.sites_dir)
-    leads_path = Path(args.leads) if args.leads else None
-
-    if args.all:
-        if not sites_root.exists():
-            print(f"[qa_bot] ERROR: {sites_root} not found", file=sys.stderr)
-            return 2
-        dirs = sorted(d for d in sites_root.iterdir()
-                      if d.is_dir() and (d / "index.html").exists())
-        if not dirs:
-            print(f"[qa_bot] ERROR: no sites in {sites_root}", file=sys.stderr)
-            return 2
-        reports = [check_site(d, load_lead(leads_path, d.name), args.threshold) for d in dirs]
-        for r in reports:
-            (sites_root / r["lead_id"] / "qa_report.json").write_text(
-                json.dumps(r, ensure_ascii=False, indent=2), encoding="utf-8")
-        out = Path("qa_reports.json" if args.output == "qa_report.json" else args.output)
-        out.write_text(json.dumps(reports, ensure_ascii=False, indent=2), encoding="utf-8")
-        n_pass = sum(1 for r in reports if r["passed"])
-        print(f"[qa_bot] {n_pass}/{len(reports)} passed (threshold {args.threshold}) -> {out}", flush=True)
-        for r in reports:
-            print(f"  {'PASS' if r['passed'] else 'FAIL'} {r['score']:3d} {r['lead_id']} "
-                  f"({len(r['issues'])} issues)", flush=True)
-        if n_pass != len(reports):
-            return 1
-        return str(out)
-
-    site_dir = Path(args.site) if args.site else (sites_root / (args.lead or ""))
-    if not args.site and not args.lead:
-        print("[qa_bot] ERROR: pass --site or --lead (or --all)", file=sys.stderr)
+    site_str = site_path if site_path is not None else (args.site or args.site_opt)
+    if not site_str:
+        print("[qa_bot] ERROR: pass the site folder path, e.g. "
+              'main("generated_sites/lead_00001")', file=sys.stderr)
         return 2
-    if not site_dir.exists():
+    site_dir = Path(site_str)
+    if not site_dir.exists() or not site_dir.is_dir():
         print(f"[qa_bot] ERROR: site not found: {site_dir}", file=sys.stderr)
         return 2
-    report = check_site(site_dir, load_lead(leads_path, site_dir.name), args.threshold)
-    (site_dir / "qa_report.json").write_text(json.dumps(report, ensure_ascii=False, indent=2),
-                                             encoding="utf-8")
-    Path(args.output).write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+    report = check_site(site_dir, load_lead_from_site(site_dir), args.threshold)
+    out_path = Path(args.output) if args.output else (site_dir / "qa_report.json")
+    append_report(out_path, report)
+    # Always mirror inside the site folder for the pipeline.
+    if out_path.resolve() != (site_dir / "qa_report.json").resolve():
+        append_report(site_dir / "qa_report.json", report)
     status = "PASS" if report["passed"] else "FAIL"
-    print(f"[qa_bot] {status} score={report['score']} {report['lead_id']} -> {args.output}", flush=True)
+    print(f"[qa_bot] {status} score={report['score']} {report['lead_id']} -> {out_path}", flush=True)
     for i in report["issues"]:
         print(f"  - {i}", flush=True)
     if not report["passed"]:
         print("[qa_bot] FAILED QA stops the pipeline (fix in Bot 5, re-run QA)", file=sys.stderr)
         return 1
-    return str(Path(args.output))
+    return str(out_path)
 
 
 if __name__ == "__main__":

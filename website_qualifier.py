@@ -65,6 +65,11 @@ from urllib.parse import urlparse
 import requests
 from bs4 import BeautifulSoup
 
+try:  # Windows consoles default to cp1252; keep unicode output from crashing
+    sys.stdout.reconfigure(encoding="utf-8")
+except Exception:  # noqa: BLE001
+    pass
+
 DEFAULT_THRESHOLD = 60
 USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
               "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -501,6 +506,7 @@ def main(argv: list[str] | None = None, **kwargs) -> str | int:
 
     bad: list[dict] = []
     good: list[dict] = []
+    unverifiable: list[dict] = []
     with ThreadPoolExecutor(max_workers=max(1, args.workers)) as ex:
         future_map = {ex.submit(qualify_one, b, args.timeout): b for b in businesses}
         done = 0
@@ -515,7 +521,17 @@ def main(argv: list[str] | None = None, **kwargs) -> str | int:
             if enriched is None:
                 continue
             analysis = enriched.get("website_analysis", {})
-            if analysis.get("details", {}).get("fetch_error") and args.skip_unreachable:
+            fetch_error = analysis.get("details", {}).get("fetch_error") or ""
+            # Bot-blocked (403/429) means a site EXISTS but refused our bot —
+            # it is unverifiable, not a bad-website lead. Never mark it bad.
+            if fetch_error in ("HTTP 403", "HTTP 429"):
+                analysis["verdict"] = "unverifiable"
+                enriched["website_analysis"] = analysis
+                unverifiable.append(enriched)
+                print(f"[{done}/{len(businesses)}] SKIP bot-blocked ({fetch_error}) "
+                      f"{orig.get('name')} {orig.get('website')}", flush=True)
+                continue
+            if fetch_error and args.skip_unreachable:
                 print(f"[{done}/{len(businesses)}] SKIP unreachable {orig.get('website')}", flush=True)
                 continue
             score = int(analysis.get("score", 0))
@@ -538,7 +554,8 @@ def main(argv: list[str] | None = None, **kwargs) -> str | int:
                                           encoding="utf-8")
         print(f"[website_qualifier] good sites -> {args.good_output} ({len(good)})", flush=True)
     print(f"[website_qualifier] input: {in_path} ({len(businesses)} checked)", flush=True)
-    print(f"[website_qualifier] bad -> {out_path} ({len(bad)}) | good discarded ({len(good)})", flush=True)
+    print(f"[website_qualifier] bad -> {out_path} ({len(bad)}) | good discarded ({len(good)}) "
+          f"| unverifiable bot-blocked skipped ({len(unverifiable)})", flush=True)
     print("[website_qualifier] feed to Bot 5: without_websites.json + bad_websites.json", flush=True)
     return str(out_path)
 

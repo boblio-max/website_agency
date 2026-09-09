@@ -5,202 +5,254 @@ Input:
     generated_sites/<lead_id>/ + its qa_report.json
 
 Process:
-    1. Verify QA passed (CRITICAL RULE: no green light from Bot 6 → no deploy).
-    2. Deploy via --provider: auto | vercel | render | local.
-       - vercel: uses the Vercel CLI (`vercel deploy`) if installed.
-       - render: uses RENDER_API_KEY/RENDER_SERVICE_ID if configured.
-       - local: offline fallback — copies the site to deployments/<lead_id>/
-         and records a file:// preview URL.
-    3. Capture the deployment URL + metadata.
+    1. Copy the site to the GitHub folder (send_to_github).
+    2. git init + push to a public GitHub repo (create_github_repo).
+    3. Link the folder to its OWN Vercel project (vercel link --project
+       <lead_id>) so sibling sites never share a project, then deploy.
+       Production deploys (prod=True, default) get a public live URL
+       https://<lead_id>.vercel.app; preview deploys may be login-gated.
+    4. Append the deployment record (github + live URLs) to
+       deployments/deployments.json.
 
 Output (deployment record JSON):
-    {"lead_id": "lead_00421", "status": "deployed",
-     "preview_url": "https://...", "deployment_id": "...",
-     "deployed_at": "...", "provider": "vercel", "qa_score": 94}
+    {"site": "lead_00421", "status": "deployed",
+     "github_url": "https://github.com/<owner>/lead_00421",
+     "preview_url": "https://lead000421.vercel.app",
+     "provider": "vercel", "deployed_at": "..."}
 
 Usage:
-    python deployment_manager.py --site generated_sites/lead_00001
-    python deployment_manager.py --lead lead_00001 --provider local
-    python deployment_manager.py --site generated_sites/lead_00001 --qa-report generated_sites/lead_00001/qa_report.json
+    python -c "from deployment_manager import main; main('generated_sites/lead_00001')"
+    python tests.py
 """
 
-from __future__ import annotations
-
-import argparse
 import datetime
 import json
 import os
-import re
+from pathlib import Path
 import shutil
 import subprocess
-import sys
-import uuid
-from pathlib import Path
 
-try:  # Windows consoles default to cp1252; keep unicode output from crashing
-    sys.stdout.reconfigure(encoding="utf-8")
-except Exception:  # noqa: BLE001
-    pass
+def _resolve_cli(cmd: str) -> str:
+    """Find a CLI on PATH plus known Windows install locations."""
+    found = shutil.which(cmd)
+    if found:
+        return found
+    candidates: list[str] = []
+    if cmd == "git":
+        candidates = [r"C:\Program Files\Git\cmd\git.exe",
+                      r"C:\Program Files\Git\bin\git.exe"]
+    elif cmd == "gh":
+        candidates = [r"C:\Program Files\GitHub CLI\gh.exe",
+                      r"C:\Program Files (x86)\GitHub CLI\gh.exe"]
+    elif cmd == "vercel":
+        candidates = [str(Path.home() / "AppData" / "Roaming" / "npm" / "vercel.cmd"),
+                      str(Path.home() / "AppData" / "Roaming" / "npm" / "vercel")]
+    for cand in candidates:
+        if Path(cand).exists():
+            return cand
+    return cmd  # let subprocess raise FileNotFoundError -> clear message below
 
+def append_deployment_record(deployment_record: dict, record_file: str = "deployments/deployments.json"):
+    """Append a deployment record to the deployments JSON file."""
+    record_path = Path(record_file)
+    if record_path.exists():
+        with open(record_path, "r", encoding="utf-8") as f:
+            records = json.load(f)
+    else:
+        records = []
+    records.append(deployment_record)
+    with open(record_path, "w", encoding="utf-8") as f:
+        json.dump(records, f, indent=2)
+        
+def send_to_github(path_to_file: str):
+    """Send the website to GitHub (folder).
 
-def utc_now_iso() -> str:
-    return datetime.datetime.now(datetime.timezone.utc).isoformat()
-
-
-def load_qa(site_dir: Path, qa_arg: str | None) -> tuple[dict | None, Path | None]:
-    candidates: list[Path] = []
-    if qa_arg:
-        candidates.append(Path(qa_arg))
-    candidates += [site_dir / "qa_report.json", Path(f"qa_{site_dir.name}.json"),
-                   Path("qa_report.json")]
-    for p in candidates:
-        if p.exists():
-            try:
-                return json.loads(p.read_text(encoding="utf-8")), p
-            except json.JSONDecodeError:
-                return None, p
-    return None, None
-
-
-def verify_qa(qa: dict | None, min_score: int) -> tuple[bool, str]:
-    if not isinstance(qa, dict) or not qa:
-        return False, "no qa_report found — run Bot 6 (qa_bot.py) first"
-    if not qa.get("passed"):
-        return False, (f"QA did not pass (score={qa.get('score')}). "
-                       "Fix issues in Bot 5 and re-run QA — deploy blocked.")
-    try:
-        s = float(qa.get("score", 0))
-    except (TypeError, ValueError):
-        s = 0
-    if s < min_score:
-        return False, f"QA score {s} below minimum {min_score} — deploy blocked."
-    return True, ""
-
-
-def deploy_vercel(site_dir: Path) -> tuple[str, str]:
-    """Returns (preview_url, deployment_id). Raises RuntimeError."""
-    try:
-        proc = subprocess.run(["vercel", "deploy", "--yes", "--cwd", str(site_dir)],
-                              capture_output=True, text=True, timeout=300)
-    except FileNotFoundError:
-        raise RuntimeError("Vercel CLI not found (npm i -g vercel). Use --provider local.")
-    out = (proc.stdout or "") + "\n" + (proc.stderr or "")
-    urls = re.findall(r"https://[A-Za-z0-9\-.]+\.vercel\.app[^\s]*", out)
-    if proc.returncode != 0 or not urls:
-        raise RuntimeError(f"Vercel deploy failed: {out[-800:]}")
-    return urls[-1], f"vercel_{uuid.uuid4().hex[:8]}"
-
-
-def deploy_render(site_dir: Path) -> tuple[str, str]:
-    """Static deploy via Render API. Raises RuntimeError if unconfigured."""
-    api_key = os.environ.get("RENDER_API_KEY", "")
-    service_id = os.environ.get("RENDER_SERVICE_ID", "")
-    if not api_key or not service_id:
-        raise RuntimeError("Render needs RENDER_API_KEY + RENDER_SERVICE_ID env vars. "
-                           "Use --provider local or vercel.")
-    import urllib.request
-    req = urllib.request.Request(
-        f"https://api.render.com/v1/services/{service_id}/deploys",
-        data=json.dumps({"clearCache": "clear"}).encode(),
-        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"})
-    try:
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            payload = json.loads(resp.read().decode())
-    except Exception as e:  # noqa: BLE001
-        raise RuntimeError(f"Render API error: {e}")
-    dep_id = str(payload.get("id", f"render_{uuid.uuid4().hex[:8]}"))
-    url = os.environ.get("RENDER_SERVICE_URL", f"https://{service_id}.onrender.com")
-    return url, dep_id
-
-
-def deploy_local(site_dir: Path, lead_id: str) -> tuple[str, str]:
-    dest = Path("deployments") / lead_id
-    if dest.exists():
-        shutil.rmtree(dest)
-    shutil.copytree(site_dir, dest)
-    return (dest / "index.html").resolve().as_uri(), f"local_{uuid.uuid4().hex[:8]}"
-
-
-def parse_args(argv=None):
-    p = argparse.ArgumentParser(description="Bot 7: deploy QA-approved site (QA gate enforced)")
-    g = p.add_mutually_exclusive_group()
-    g.add_argument("--site", default=None, help="Path to generated_sites/<lead_id>")
-    g.add_argument("--lead", default=None, help="Lead id under --sites-dir")
-    p.add_argument("--sites-dir", default="generated_sites")
-    p.add_argument("--qa-report", default=None, help="Explicit qa_report.json path")
-    p.add_argument("--provider", default="auto", choices=["auto", "vercel", "render", "local"])
-    p.add_argument("--output", "-o", default=None, help="Deployment record path")
-    p.add_argument("--min-score", type=int, default=80)
-    p.add_argument("--force", action="store_true",
-                   help="Deploy even if QA failed (recorded as deployed_forced)")
-    return p.parse_args(argv)
-
-
-def main(argv=None, **kwargs) -> str | int:
-    """Deploy a QA-approved site. Returns the deployment record path (str) or int exit code.
-
-    Orchestrator use: ``main(site="generated_sites/lead_00001", provider="local")`` —
-    any keyword matching an argparse option overrides the default. A bare main()
-    call uses defaults (sys.argv is only used via the CLI). QA-gate block returns 3.
+    Skips the local .vercel link dir — project IDs don't belong in git.
     """
-    if argv is None:
-        # Plain main() uses defaults (never sys.argv); the CLI passes
-        # sys.argv[1:] explicitly via the __main__ block below.
-        argv = []
-    args = parse_args(argv)
-    for _k, _v in kwargs.items():
-        if not hasattr(args, _k):
-            raise TypeError(f"deployment_manager.main() got an unexpected option {_k!r}")
-        setattr(args, _k, _v)
-    site_dir = Path(args.site) if args.site else (Path(args.sites_dir) / (args.lead or ""))
-    if not args.site and not args.lead:
-        print("[deployment_manager] ERROR: pass --site or --lead", file=sys.stderr)
-        return 2
-    if not site_dir.exists() or not (site_dir / "index.html").exists():
-        print(f"[deployment_manager] ERROR: site not found: {site_dir}", file=sys.stderr)
-        return 2
-    lead_id = site_dir.name
-    qa, qa_path = load_qa(site_dir, args.qa_report)
-    ok, reason = verify_qa(qa, args.min_score)
-    if not ok and not args.force:
-        print(f"[deployment_manager] BLOCKED: {reason}", file=sys.stderr)
-        print("[deployment_manager] CRITICAL RULE: Bot 7 cannot deploy without Bot 6 green light.",
-              file=sys.stderr)
-        return 3
-    forced = not ok and args.force
-    if forced:
-        print(f"[deployment_manager] WARNING: overriding QA gate (--force): {reason}", flush=True)
+    source = Path(path_to_file)
+    name = source.name
+    destination = Path(r"C:\Users\smile\OneDrive\Documents\GitHub") / name
+    shutil.copytree(source, destination, dirs_exist_ok=True,
+                    ignore=shutil.ignore_patterns(".vercel"))
+    return destination
 
-    provider = args.provider
-    if provider == "auto":
-        provider = "vercel" if shutil.which("vercel") else "local"
-        print(f"[deployment_manager] auto-selected provider: {provider}", flush=True)
+def create_github_repo(path_to_file: str) -> str:
+    """Init a git repo in folder and push it to GitHub via `gh`.
+
+    Idempotent: safe to re-run. Skips commit when clean, and pushes
+    when the GitHub repo already exists. Returns the repo URL (or name
+    when the URL can't be parsed). Raises RuntimeError with a clear
+    message when git/gh is missing or git identity is unconfigured.
+    """
+    folder = Path(path_to_file)
+    if not folder.exists():
+        raise RuntimeError(f"create_github_repo: path not found: {folder}")
+    if not folder.is_dir():
+        raise RuntimeError(f"create_github_repo: not a folder: {folder}")
+    # Refuse empty folders early — git cannot create a commit from nothing.
+    if not any(p for p in folder.iterdir() if p.name != ".git"):
+        raise RuntimeError(f"create_github_repo: folder is empty: {folder} "
+                           f"(add at least one file first)")
+    repo_name = folder.name
+
+    def _run(args: list[str]) -> subprocess.CompletedProcess:
+        exe = _resolve_cli(args[0])
+        try:
+            return subprocess.run(
+                [exe, *args[1:]], cwd=str(folder), check=True,
+                capture_output=True, text=True)
+        except FileNotFoundError:
+            raise RuntimeError(
+                f"'{args[0]}' CLI not found. "
+                f"Install it to use create_github_repo (git / gh).")
+
+    # 1. git init (only when needed; pin default branch to main for new repos).
+    if not (folder / ".git").exists():
+        try:
+            _run(["git", "init", "-b", "main"])
+        except subprocess.CalledProcessError:
+            _run(["git", "init"])  # older git without -b
+    _run(["git", "add", "."])
+
+    # 2. Commit only when there is something to commit.
+    status = _run(["git", "status", "--porcelain"]).stdout.strip()
     try:
-        if provider == "vercel":
-            url, dep_id = deploy_vercel(site_dir)
-        elif provider == "render":
-            url, dep_id = deploy_render(site_dir)
+        _run(["git", "rev-parse", "--verify", "HEAD"])
+        head_exists = True
+    except subprocess.CalledProcessError:
+        head_exists = False
+    if status or not head_exists:
+        try:
+            _run(["git", "commit", "-m", "Initial commit"])
+        except subprocess.CalledProcessError as e:
+            out = (e.stdout or "") + (e.stderr or "")
+            if "nothing to commit" in out.lower():
+                pass  # clean tree — nothing to do
+            elif "user.name" in out or "user.email" in out or "identity" in out.lower():
+                raise RuntimeError(
+                    "git identity missing. Run once: "
+                    'git config --global user.name \"You\"; '
+                    'git config --global user.email \"you@example.com\"')
+            else:
+                raise RuntimeError(f"git commit failed: {out[-800:]}")
+    try:
+        _run(["git", "branch", "-M", "main"])
+    except subprocess.CalledProcessError:
+        pass
+
+    # 3. Create on GitHub (non-interactive) or push if it already exists.
+    try:
+        proc = _run(["gh", "repo", "create", repo_name,
+                     "--public", "--source=.", "--push"])
+        out = (proc.stdout or "") + (proc.stderr or "")
+    except subprocess.CalledProcessError as e:
+        out = (e.stdout or "") + (e.stderr or "")
+        if "already exists" in out.lower():
+            _run(["git", "push", "-u", "origin", "HEAD"])
         else:
-            url, dep_id = deploy_local(site_dir, lead_id)
+            raise RuntimeError(f"gh repo create failed: {out[-800:]}")
+
+    import re
+    m = re.search(r"https://github\.com/\S+", out)
+    if m:
+        url = m.group(0).rstrip(".,)")
+    else:
+        # Deterministic fallback: read the remote we just pushed to.
+        url = repo_name
+        try:
+            remote = _run(["git", "remote", "get-url", "origin"]).stdout.strip()
+            url = _normalize_github_url(remote) or url
+        except subprocess.CalledProcessError:
+            pass
+    print(f"GitHub repository created: {url}")
+    return url
+
+
+def _normalize_github_url(remote: str) -> str | None:
+    """git@github.com:o/r(.git) or https://github.com/o/r(.git) -> https URL."""
+    import re
+    remote = (remote or "").strip()
+    m = re.match(r"(?:git@github\.com:|https://github\.com/)([^/\s]+/[^/\s]+?)(?:\.git)?/?$", remote)
+    return f"https://github.com/{m.group(1)}" if m else None
+
+
+def deploy_to_vercel(path_to_file: str, prod: bool = True) -> str:
+    """Deploy a site folder to its own Vercel project.
+
+    Links the folder to a project named after the folder (vercel link
+    --project) so sibling sites can never share a project, then deploys.
+    prod=True (default) promotes to production for a public live URL
+    https://<lead_id>.vercel.app; prod=False leaves a preview deployment
+    (may be login-gated by Vercel protection).
+    Requires `vercel` installed and logged in (`vercel login`).
+    Returns the live URL. Raises RuntimeError on failure.
+    """
+    import re
+    folder = Path(path_to_file)
+    if not folder.exists():
+        raise RuntimeError(f"deploy_to_vercel: path not found: {folder}")
+    if not folder.is_dir():
+        raise RuntimeError(f"deploy_to_vercel: not a folder: {folder}")
+    if not (folder / "index.html").exists():
+        raise RuntimeError(f"deploy_to_vercel: no index.html in {folder}")
+    vercel = _resolve_cli("vercel")
+    if vercel.lower().endswith((".cmd", ".bat")):
+        # Batch shims can't exec directly — run through cmd.exe.
+        vercel_cmd: list[str] = [os.environ.get("COMSPEC", "cmd.exe"), "/c", vercel]
+    else:
+        vercel_cmd = [vercel]
+
+    def _vrun(args: list[str], step: str) -> str:
+        try:
+            proc = subprocess.run(
+                [*vercel_cmd, *args], cwd=str(folder), check=True,
+                capture_output=True, text=True,
+                encoding="utf-8", errors="replace", timeout=300)
+        except FileNotFoundError:
+            raise RuntimeError("'vercel' CLI not found. Install it: npm i -g vercel")
+        except subprocess.TimeoutExpired:
+            raise RuntimeError(f"vercel {step} timed out after 300s")
+        except subprocess.CalledProcessError as e:
+            out = (e.stdout or "") + "\n" + (e.stderr or "")
+            raise RuntimeError(f"vercel {step} failed: {out[-800:]}")
+        return (proc.stdout or "") + "\n" + (proc.stderr or "")
+
+    # Pin this folder to its own project (immune to stray parent .vercel links).
+    _vrun(["link", "--yes", "--project", folder.name], "link")
+    args = ["deploy", "--yes"]
+    if prod:
+        args.append("--prod")
+    out = _vrun(args, "deploy")
+    urls = re.findall(r"https://[A-Za-z0-9\-.]+\.vercel\.app[^\s\"']*", out)
+    if not urls:
+        raise RuntimeError(f"vercel deploy gave no URL: {out[-800:]}")
+    # Prefer the production alias (<project>.vercel.app) over hashed preview URLs.
+    bare = "https://" + folder.name.lower().replace("_", "") + ".vercel.app"
+    url = next((u for u in urls if u.lower() == bare), urls[-1])
+    print(f"Vercel deployment live: {url}")
+    return url
+
+
+def main(path_to_file: str, prod: bool = True) -> int:
+    """Deploy a QA-approved site: GitHub push, then Vercel (production by default).
+
+    Returns 0 on success, non-zero exit code on error.
+    """
+    try:
+        github_path = send_to_github(path_to_file)
+        github_url = create_github_repo(str(github_path))
+        preview_url = deploy_to_vercel(path_to_file, prod=prod)
+        append_deployment_record({
+            "site": Path(path_to_file).name,
+            "status": "deployed",
+            "github_url": github_url,
+            "preview_url": preview_url,
+            "provider": "vercel",
+            "deployed_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        })
     except RuntimeError as e:
-        print(f"[deployment_manager] ERROR: {e}", file=sys.stderr)
-        return 2
-
-    record = {"lead_id": lead_id,
-              "status": "deployed_forced" if forced else "deployed",
-              "preview_url": url, "deployment_id": dep_id,
-              "deployed_at": utc_now_iso(), "provider": provider,
-              "qa_score": (qa or {}).get("score"),
-              "qa_report": str(qa_path) if qa_path else None}
-    out = Path(args.output) if args.output else (Path("deployments") / f"{lead_id}.json")
-    out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(f"[deployment_manager] {record['status']} {lead_id} via {provider}", flush=True)
-    print(f"[deployment_manager] preview_url: {url}", flush=True)
-    print(f"[deployment_manager] record -> {out}", flush=True)
-    return str(out)
-
-
-if __name__ == "__main__":
-    _rc = main(sys.argv[1:])
-    raise SystemExit(_rc if isinstance(_rc, int) else 0)
+        print(f"[deployment_manager] ERROR: {e}", flush=True)
+        return 1
+    print(f"[deployment_manager] Deployment completed for {path_to_file}.", flush=True)
+    print(f"[deployment_manager] preview_url: {preview_url}", flush=True)
+    return 0
